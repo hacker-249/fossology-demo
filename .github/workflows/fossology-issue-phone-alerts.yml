@@ -1,0 +1,130 @@
+name: FOSSology Issue Phone Alerts
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fossology-issue-phone-alerts
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Restore checkpoint
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor-state
+          key: fossology-issue-monitor-${{ github.run_id }}
+          restore-keys: |
+            fossology-issue-monitor-
+
+      - name: Initialize baseline on first run
+        if: steps.cache.outputs.cache-matched-key == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .monitor-state
+
+          curl --fail --silent --show-error --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/fossology/fossology/issues?state=all&sort=created&direction=desc&per_page=100" \
+            -o /tmp/baseline.json
+
+          jq '[.[] | select(has("pull_request") | not) | .number] | max // 0' \
+            /tmp/baseline.json > .monitor-state/last_number
+
+          echo "Baseline initialized. Existing issues will not trigger alerts."
+
+      - name: Find and notify new issues
+        if: steps.cache.outputs.cache-matched-key != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NTFY_TOPIC:-}" ]]; then
+            echo "::error::Add the NTFY_TOPIC repository secret in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          LAST=$(cat .monitor-state/last_number)
+          MAX_SEEN="$LAST"
+          mkdir -p /tmp/fossology-issues
+          : > /tmp/fossology-issues/new.jsonl
+
+          PAGE=1
+          while [[ "$PAGE" -le 10 ]]; do
+            FILE="/tmp/fossology-issues/page-$PAGE.json"
+
+            curl --fail --silent --show-error --retry 3 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/fossology/fossology/issues?state=all&sort=created&direction=desc&per_page=100&page=$PAGE" \
+              -o "$FILE"
+
+            COUNT=$(jq 'length' "$FILE")
+            [[ "$COUNT" -gt 0 ]] || break
+
+            jq -c --argjson last "$LAST" \
+              '.[] | select(.number > $last) | select(has("pull_request") | not)' \
+              "$FILE" >> /tmp/fossology-issues/new.jsonl
+
+            PAGE_MAX=$(jq '[.[].number] | max // 0' "$FILE")
+            if [[ "$PAGE_MAX" -gt "$MAX_SEEN" ]]; then
+              MAX_SEEN="$PAGE_MAX"
+            fi
+
+            PAGE_MIN=$(jq '[.[].number] | min // 0' "$FILE")
+            if [[ "$PAGE_MIN" -le "$LAST" || "$COUNT" -lt 100 ]]; then
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+          done
+
+          jq -s 'sort_by(.number)[] |
+            [.number, (.title | gsub("[\\r\\n\\t]"; " ")),
+             .html_url, .user.login, .created_at] | @tsv' \
+            /tmp/fossology-issues/new.jsonl > /tmp/fossology-issues/sorted.tsv
+
+          while IFS=$'\t' read -r NUMBER TITLE URL AUTHOR CREATED; do
+            [[ -n "${NUMBER:-}" ]] || continue
+
+            curl --fail --silent --show-error --retry 3 \
+              -H "Title: New FOSSology issue #$NUMBER" \
+              -H "Priority: high" \
+              -H "Tags: github,bell" \
+              --data-binary "New issue in fossology/fossology
+
+          #$NUMBER: $TITLE
+          Author: @$AUTHOR
+          Created: $CREATED
+
+          $URL" \
+              "https://ntfy.sh/$NTFY_TOPIC"
+
+            echo "Sent notification for issue #$NUMBER"
+          done < /tmp/fossology-issues/sorted.tsv
+
+          echo "$MAX_SEEN" > .monitor-state/last_number
+
+      - name: Save checkpoint
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor-state
+          key: fossology-issue-monitor-${{ github.run_id }}
