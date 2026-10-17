@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: fossology-issue-phone-alerts
@@ -18,37 +18,44 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Restore checkpoint
-        id: cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .monitor-state
-          key: fossology-issue-monitor-${{ github.run_id }}
-          restore-keys: |
-            fossology-issue-monitor-
-
-      - name: Initialize baseline on first run
-        if: steps.cache.outputs.cache-matched-key == ''
+      - name: Load durable checkpoint
+        id: checkpoint
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .monitor-state
 
-          curl --fail --silent --show-error --retry 3 \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/fossology/fossology/issues?state=all&sort=created&direction=desc&per_page=100" \
-            -o /tmp/baseline.json
+          git init state-repo
+          git -C state-repo config user.name "github-actions[bot]"
+          git -C state-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C state-repo remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          jq '[.[] | select(has("pull_request") | not) | .number] | max // 0' \
-            /tmp/baseline.json > .monitor-state/last_number
+          if git -C state-repo ls-remote --exit-code --heads origin monitor-state >/dev/null 2>&1; then
+            git -C state-repo fetch --depth=1 origin monitor-state
+            git -C state-repo checkout -B monitor-state FETCH_HEAD
+            cp state-repo/last_number "$RUNNER_TEMP/last_number"
+            echo "initialized=false" >> "$GITHUB_OUTPUT"
+            echo "Loaded durable checkpoint: $(cat "$RUNNER_TEMP/last_number")"
+          else
+            echo "No durable checkpoint exists yet; initializing a baseline."
+            curl --fail --silent --show-error --retry 3 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/fossology/fossology/issues?state=all&sort=created&direction=desc&per_page=100" \
+              -o "$RUNNER_TEMP/baseline.json"
 
-          echo "Baseline initialized. Existing issues will not trigger alerts."
+            jq '[.[] | select(has("pull_request") | not) | .number] | max // 0' \
+              "$RUNNER_TEMP/baseline.json" > state-repo/last_number
+            git -C state-repo add last_number
+            git -C state-repo commit -m "Initialize FOSSology issue monitor checkpoint"
+            git -C state-repo push origin HEAD:monitor-state
+            echo "initialized=true" >> "$GITHUB_OUTPUT"
+            echo "Baseline saved to monitor-state. Existing issues will not trigger alerts."
+          fi
 
       - name: Find and notify new issues
-        if: steps.cache.outputs.cache-matched-key != ''
+        if: steps.checkpoint.outputs.initialized == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -61,7 +68,7 @@ jobs:
             exit 1
           fi
 
-          LAST=$(cat .monitor-state/last_number)
+          LAST=$(cat "$RUNNER_TEMP/last_number")
           MAX_SEEN="$LAST"
           mkdir -p /tmp/fossology-issues
           : > /tmp/fossology-issues/new.jsonl
@@ -120,11 +127,12 @@ jobs:
             echo "Sent notification for issue #$NUMBER"
           done < /tmp/fossology-issues/sorted.tsv
 
-          echo "$MAX_SEEN" > .monitor-state/last_number
-
-      - name: Save checkpoint
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: .monitor-state
-          key: fossology-issue-monitor-${{ github.run_id }}
+          if [[ "$MAX_SEEN" -gt "$LAST" ]]; then
+            echo "$MAX_SEEN" > state-repo/last_number
+            git -C state-repo add last_number
+            git -C state-repo commit -m "Update FOSSology issue monitor checkpoint"
+            git -C state-repo push origin HEAD:monitor-state
+            echo "Checkpoint updated to $MAX_SEEN"
+          else
+            echo "No newer issue numbers found; checkpoint unchanged."
+          fi
